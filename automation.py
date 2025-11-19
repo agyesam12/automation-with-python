@@ -1,63 +1,112 @@
 import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill, Font
-from openpyxl.utils import get_column_letter
 import sys
 
-def compare_worksheets(file_path, sheet1, sheet2, output_path, key_column='ID'):
+def list_file_columns(file_path):
     """
-    Compare two worksheets within the same Excel file and create a report of mismatches.
+    List all columns available in an Excel file.
     
     Args:
-        file_path: Path to Excel file containing both worksheets
-        sheet1: Name of first worksheet
-        sheet2: Name of second worksheet
+        file_path: Path to Excel file
+    """
+    try:
+        df = pd.read_excel(file_path)
+        print(f"\nColumns in '{file_path}':")
+        for idx, col in enumerate(df.columns, 1):
+            print(f"  {idx}. {col}")
+        return df.columns.tolist()
+    except Exception as e:
+        print(f"✗ Error reading file: {e}")
+        return []
+
+def compare_excel_files(file1_path, file2_path, output_path, match_columns=None):
+    """
+    Compare two Excel files using multiple columns as composite key.
+    
+    Args:
+        file1_path: Path to first Excel file
+        file2_path: Path to second Excel file
         output_path: Path to save the comparison report
-        key_column: Column name to use as unique identifier (default: 'ID')
+        match_columns: List of columns to use as composite key for matching (e.g., ['REGION', 'CONSTITUENCY'])
     """
     
     try:
-        # Read worksheets
-        df1 = pd.read_excel(file_path, sheet_name=sheet1)
-        df2 = pd.read_excel(file_path, sheet_name=sheet2)
+        # Read Excel files
+        df1 = pd.read_excel(file1_path)
+        df2 = pd.read_excel(file2_path)
         
-        print(f"✓ Loaded '{sheet1}': {len(df1)} rows")
-        print(f"✓ Loaded '{sheet2}': {len(df2)} rows")
+        print(f"✓ Loaded {file1_path}: {len(df1)} rows")
+        print(f"✓ Loaded {file2_path}: {len(df2)} rows")
         
-        # Ensure key column exists
-        if key_column not in df1.columns or key_column not in df2.columns:
-            print(f"✗ Error: '{key_column}' column not found in one or both worksheets")
-            return
+        if match_columns is None:
+            match_columns = ['REGION', 'CONSTITUENCY']
         
-        # Set key column as index
-        df1_indexed = df1.set_index(key_column)
-        df2_indexed = df2.set_index(key_column)
+        # Ensure all match columns exist in both files
+        for col in match_columns:
+            if col not in df1.columns or col not in df2.columns:
+                print(f"✗ Error: '{col}' column not found in one or both files")
+                print("\nAvailable columns:")
+                list_file_columns(file1_path)
+                list_file_columns(file2_path)
+                return
+        
+        # Create composite key from match columns
+        df1['_COMPOSITE_KEY'] = df1[match_columns].astype(str).agg('_'.join, axis=1)
+        df2['_COMPOSITE_KEY'] = df2[match_columns].astype(str).agg('_'.join, axis=1)
+        
+        # Check for duplicates
+        duplicates1 = df1['_COMPOSITE_KEY'].duplicated().sum()
+        duplicates2 = df2['_COMPOSITE_KEY'].duplicated().sum()
+        
+        if duplicates1 > 0:
+            print(f"\n⚠ WARNING: Found {duplicates1} duplicate REGION+CONSTITUENCY combinations in {file1_path}")
+        if duplicates2 > 0:
+            print(f"⚠ WARNING: Found {duplicates2} duplicate REGION+CONSTITUENCY combinations in {file2_path}")
+        
+        # Group by composite key and aggregate (keep first occurrence or summarize)
+        # For this comparison, we'll keep the first occurrence
+        df1_deduped = df1.drop_duplicates(subset='_COMPOSITE_KEY', keep='first')
+        df2_deduped = df2.drop_duplicates(subset='_COMPOSITE_KEY', keep='first')
+        
+        print(f"\n✓ After deduplication: {len(df1_deduped)} unique records in {file1_path}")
+        print(f"✓ After deduplication: {len(df2_deduped)} unique records in {file2_path}")
+        
+        # Set composite key as index
+        df1_indexed = df1_deduped.set_index('_COMPOSITE_KEY')
+        df2_indexed = df2_deduped.set_index('_COMPOSITE_KEY')
         
         # Initialize results list
         mismatches = []
         
-        # Get all unique keys from both worksheets
+        # Get all unique keys from both files
         all_keys = set(df1_indexed.index) | set(df2_indexed.index)
+        
+        print(f"✓ Total unique combinations to compare: {len(all_keys)}")
         
         # Compare each record
         for key in sorted(all_keys):
-            in_sheet1 = key in df1_indexed.index
-            in_sheet2 = key in df2_indexed.index
+            in_file1 = key in df1_indexed.index
+            in_file2 = key in df2_indexed.index
             
-            if in_sheet1 and in_sheet2:
-                # Record exists in both sheets - check for differences
+            if in_file1 and in_file2:
+                # Record exists in both files - check for differences
                 row1 = df1_indexed.loc[key]
                 row2 = df2_indexed.loc[key]
                 
-                # Get all columns from both sheets
-                all_cols = set(df1.columns) | set(df2.columns)
+                # Handle case where loc might still return Series (shouldn't happen after dedup, but safe)
+                if isinstance(row1, pd.DataFrame):
+                    row1 = row1.iloc[0]
+                if isinstance(row2, pd.DataFrame):
+                    row2 = row2.iloc[0]
                 
-                for col in all_cols:
-                    if col == key_column:
-                        continue
-                    
-                    val1 = row1.get(col) if in_sheet1 else 'N/A'
-                    val2 = row2.get(col) if in_sheet2 else 'N/A'
+                # Get all columns from both files (excluding the composite key)
+                all_cols = set(df1_deduped.columns) | set(df2_deduped.columns)
+                all_cols.discard('_COMPOSITE_KEY')
+                
+                for col in sorted(all_cols):
+                    val1 = row1.get(col) if col in row1.index else None
+                    val2 = row2.get(col) if col in row2.index else None
                     
                     # Convert NaN to string for comparison
                     val1_str = str(val1) if pd.notna(val1) else 'MISSING'
@@ -65,55 +114,69 @@ def compare_worksheets(file_path, sheet1, sheet2, output_path, key_column='ID'):
                     
                     if val1_str != val2_str:
                         mismatches.append({
-                            'ID': key,
+                            'Match_Key': key,
                             'Field': col,
-                            f'{sheet1}_Value': val1_str,
-                            f'{sheet2}_Value': val2_str,
-                            'Status': f"MISMATCH - {sheet1}: {val1_str}, {sheet2}: {val2_str}"
+                            'MIGRATE_Value': val1_str,
+                            'POLITICAL_Value': val2_str,
+                            'Status': 'VALUE_MISMATCH',
+                            'File_Source': 'Both'
                         })
             
-            elif in_sheet1 and not in_sheet2:
-                # Record only in sheet 1
+            elif in_file1 and not in_file2:
+                # Record only in file 1
                 row1 = df1_indexed.loc[key]
-                for col in df1.columns:
-                    if col != key_column:
-                        val1 = row1.get(col)
+                if isinstance(row1, pd.DataFrame):
+                    row1 = row1.iloc[0]
+                    
+                for col in sorted(df1_deduped.columns):
+                    if col != '_COMPOSITE_KEY':
+                        val1 = row1.get(col) if col in row1.index else None
                         val1_str = str(val1) if pd.notna(val1) else 'MISSING'
                         mismatches.append({
-                            'ID': key,
+                            'Match_Key': key,
                             'Field': col,
-                            f'{sheet1}_Value': val1_str,
-                            f'{sheet2}_Value': 'RECORD_NOT_FOUND',
-                            'Status': f'RECORD_ONLY_IN_{sheet1.upper()}'
+                            'MIGRATE_Value': val1_str,
+                            'POLITICAL_Value': 'N/A - RECORD_NOT_IN_FILE',
+                            'Status': 'MISSING_IN_POLITICAL',
+                            'File_Source': 'MIGRATE only'
                         })
             
             else:
-                # Record only in sheet 2
+                # Record only in file 2
                 row2 = df2_indexed.loc[key]
-                for col in df2.columns:
-                    if col != key_column:
-                        val2 = row2.get(col)
+                if isinstance(row2, pd.DataFrame):
+                    row2 = row2.iloc[0]
+                    
+                for col in sorted(df2_deduped.columns):
+                    if col != '_COMPOSITE_KEY':
+                        val2 = row2.get(col) if col in row2.index else None
                         val2_str = str(val2) if pd.notna(val2) else 'MISSING'
                         mismatches.append({
-                            'ID': key,
+                            'Match_Key': key,
                             'Field': col,
-                            f'{sheet1}_Value': 'RECORD_NOT_FOUND',
-                            f'{sheet2}_Value': val2_str,
-                            'Status': f'RECORD_ONLY_IN_{sheet2.upper()}'
+                            'MIGRATE_Value': 'N/A - RECORD_NOT_IN_FILE',
+                            'POLITICAL_Value': val2_str,
+                            'Status': 'MISSING_IN_MIGRATE',
+                            'File_Source': 'POLITICAL only'
                         })
         
         # Create results DataFrame
         results_df = pd.DataFrame(mismatches)
         
         if len(results_df) == 0:
-            print("\n✓ No mismatches found! Both worksheets are identical.")
+            print("\n✓ No mismatches found! Both files are identical.")
         else:
-            print(f"\n✓ Found {len(results_df)} mismatches")
-            print("\nMismatch Summary:")
-            print(results_df.to_string(index=False))
+            print(f"\n✓ Found {len(results_df)} total discrepancies")
+            print("\nDiscrepancy Summary by Type:")
+            status_counts = results_df['Status'].value_counts()
+            for status, count in status_counts.items():
+                print(f"  - {status}: {count}")
+            
+            print("\nFirst 30 discrepancies:")
+            print(results_df.head(30).to_string(index=False))
         
         # Save to Excel with formatting
-        results_df.to_excel(output_path, index=False, sheet_name='Mismatches')
+        results_df.to_excel(output_path, index=False, sheet_name='Discrepancies')
         
         # Apply formatting to output file
         wb = openpyxl.load_workbook(output_path)
@@ -128,73 +191,61 @@ def compare_worksheets(file_path, sheet1, sheet2, output_path, key_column='ID'):
             cell.font = header_font
         
         # Color coding for status
-        mismatch_fill = PatternFill(start_color='FFE699', end_color='FFE699', fill_type='solid')
-        sheet1_only_fill = PatternFill(start_color='C6E0B4', end_color='C6E0B4', fill_type='solid')
-        sheet2_only_fill = PatternFill(start_color='F4B084', end_color='F4B084', fill_type='solid')
+        value_mismatch_fill = PatternFill(start_color='FFE699', end_color='FFE699', fill_type='solid')
+        missing_political_fill = PatternFill(start_color='C6E0B4', end_color='C6E0B4', fill_type='solid')
+        missing_migrate_fill = PatternFill(start_color='F4B084', end_color='F4B084', fill_type='solid')
         
         for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row), start=2):
             status_cell = row[4]  # Status column (5th column)
             status = status_cell.value
             
             if status:
-                if 'MISMATCH' in status:
-                    status_cell.fill = mismatch_fill
-                elif sheet1.upper() in status:
-                    status_cell.fill = sheet1_only_fill
-                elif sheet2.upper() in status:
-                    status_cell.fill = sheet2_only_fill
+                if 'VALUE_MISMATCH' in status:
+                    status_cell.fill = value_mismatch_fill
+                elif 'MISSING_IN_POLITICAL' in status:
+                    status_cell.fill = missing_political_fill
+                elif 'MISSING_IN_MIGRATE' in status:
+                    status_cell.fill = missing_migrate_fill
         
         # Adjust column widths
-        ws.column_dimensions['A'].width = 15
+        ws.column_dimensions['A'].width = 30
         ws.column_dimensions['B'].width = 20
         ws.column_dimensions['C'].width = 25
         ws.column_dimensions['D'].width = 25
-        ws.column_dimensions['E'].width = 40
+        ws.column_dimensions['E'].width = 20
+        ws.column_dimensions['F'].width = 20
         
         wb.save(output_path)
         print(f"\n✓ Report saved to: {output_path}")
         
     except FileNotFoundError as e:
         print(f"✗ Error: File not found - {e}")
-    except ValueError as e:
-        print(f"✗ Error: Worksheet not found - {e}")
     except Exception as e:
         print(f"✗ Error: {e}")
-
-def list_worksheets(file_path):
-    """
-    List all worksheets available in an Excel file.
-    
-    Args:
-        file_path: Path to Excel file
-    """
-    try:
-        xls = pd.ExcelFile(file_path)
-        print(f"Available worksheets in '{file_path}':")
-        for idx, sheet in enumerate(xls.sheet_names, 1):
-            print(f"  {idx}. {sheet}")
-        return xls.sheet_names
-    except Exception as e:
-        print(f"✗ Error reading file: {e}")
-        return []
+        import traceback
+        traceback.print_exc()
 
 # Example usage
 if __name__ == '__main__':
-    # Modify these to your actual file and worksheet names
-    file_path = 'politicians_data.xlsx'
-    sheet1_name = 'Sheet1'
-    sheet2_name = 'Sheet2'
-    output = 'worksheet_comparison_report.xlsx'
+    # Modify these paths to your actual files
+    file1 = 'MIGRATE.xlsx'
+    file2 = 'political.xlsx'
+    output = 'comparison_report.xlsx'
     
-    # Optional: List available worksheets first
-    # list_worksheets(file_path)
+    # First, list the columns to discover what's available
+    print("=" * 60)
+    print("DISCOVERING COLUMNS IN YOUR FILES")
+    print("=" * 60)
+    list_file_columns(file1)
+    list_file_columns(file2)
     
-    # Use 'ID' as the key column (adjust if your column name is different)
-    compare_worksheets(file_path, sheet1_name, sheet2_name, output, key_column='ID')
+    # Columns to use for matching records between files
+    # Using REGION and CONSTITUENCY as composite key
+    match_cols = ['REGION', 'CONSTITUENCY']
     
-    # Uncomment below to use command line arguments
-    # if len(sys.argv) > 3:
-    #     compare_worksheets(sys.argv[1], sys.argv[2], sys.argv[3], 
-    #                        sys.argv[4] if len(sys.argv) > 4 else 'comparison_report.xlsx')
-    # else:
-    #     print("Usage: python script.py <file.xlsx> <sheet1_name> <sheet2_name> [output.xlsx]")
+    print("\n" + "=" * 60)
+    print("STARTING COMPARISON")
+    print("=" * 60)
+    print(f"Matching records by: {match_cols}")
+    print("=" * 60)
+    compare_excel_files(file1, file2, output, match_columns=match_cols)
